@@ -28,18 +28,21 @@ class XPT2046:
     def raw(self):
         if self.irq.value():
             return None
-        # A conservative clock makes touch reads more reliable with jumper
-        # wires and reduces occasional missed/unstable samples.
-        self.spi.init(baudrate=1_000_000, polarity=0, phase=0)
+
+        # V15: 2 MHz + median of 3 samples. V14 used 1 MHz + 5 samples.
+        # The median still rejects a bad edge sample, while a short tap is
+        # captured much sooner. If IRQ releases during sampling, the samples
+        # already collected are still usable.
+        self.spi.init(baudrate=2_000_000, polarity=0, phase=0)
         xs = []
         ys = []
-        for _ in range(5):
-            xs.append(self._read12(0xD0))  # X position
-            ys.append(self._read12(0x90))  # Y position
-            sleep_us(80)
+        for _ in range(3):
+            xs.append(self._read12(0xD0))
+            ys.append(self._read12(0x90))
+            sleep_us(20)
         xs.sort()
         ys.sort()
-        return xs[2], ys[2]
+        return xs[1], ys[1]
 
     @staticmethod
     def _map(value, low, high, size):

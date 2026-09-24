@@ -1,10 +1,11 @@
+# CKP/CMP V16 ULTRA FAST + TOUCH LOCK / MOVE TOLERANCE
 import rp2
 import framebuf
 import ujson
 from machine import Pin, SPI
 from time import ticks_diff, ticks_ms, sleep_ms
 
-from st7735_pico import ST7735, BLACK, WHITE, RED, GREEN, BLUE, CYAN, YELLOW, GRAY
+from st7789_pico import ST7789, BLACK, WHITE, RED, GREEN, BLUE, CYAN, YELLOW, GRAY
 from xpt2046_pico import XPT2046
 
 
@@ -65,18 +66,30 @@ patterns = {
     4: {"name": "24-2", "car1": "NISSAN CAS 24-2", "car2": "AFTERMARKET WHEEL", "slots": 24, "missing": (22, 23), "cmp_start": 4, "cmp_end": 8},
     5: {"name": "24-1", "car1": "NISSAN RB/SR 24-1", "car2": "AFTERMARKET WHEEL", "slots": 24, "missing": (23,), "cmp_start": 4, "cmp_end": 8},
     6: {"name": "12+1", "car1": "HONDA K20 / K24", "car2": "12+1 SYSTEM", "slots": 12, "missing": (), "extra_tooth_slot": 11, "cmp_start": 2, "cmp_end": 4},
-    # 4JK1/4JJ1: 56 CKP pulses per crank revolution plus a 30-degree
-    # reference gap. Four missing positions on a 60 x 6-degree grid produce
-    # the specified 30-degree interval from the last pulse to the next pulse.
-    # CMP stays LOW in this entry until its exact 720-degree phase and pulse
-    # widths have been verified from the target engine/ECU waveform.
-    7: {"name": "ISUZU", "car1": "4JK1 / 4JJ1", "car2": "CKP TEST ONLY", "slots": 60, "missing": (56, 57, 58, 59), "ckp_only": True},
-    # EXPERIMENTAL user-requested variant. This keeps the verified Isuzu CKP
-    # structure but substitutes one arbitrary CMP window per 720-degree cycle.
-    # CMP is HIGH from crank slots 10..19 (60 crank degrees), beginning 60
-    # degrees after slot zero, and remains LOW throughout the second crank
-    # revolution. It is NOT the production 4JK1/4JJ1 five-pulse CMP pattern.
-    8: {"name": "ISU-1C", "car1": "4JK1 / 4JJ1 TEST", "car2": "1CMP EXPERIMENT", "slots": 60, "missing": (56, 57, 58, 59), "cmp_start": 10, "cmp_end": 20},
+    # Isuzu service-training waveform for D-Max 4JK1-TC / 4JJ1-TC.
+    # CKP: 56 active-low pulses per crank revolution on a 60 x 6-degree grid.
+    # Positions 56..59 are absent, so the last falling edge to the next one is
+    # 30 crank degrees. The missing-tooth region therefore remains HIGH.
+    # CMP: 5 active-low pulses per 720 crank degrees. Four main falling edges
+    # are 180 crank degrees apart. The extra reference falling edge is 30
+    # degrees before the main edge beside the CKP gap. From the enlarged Isuzu
+    # waveform: the reference pulse rises at the last CKP rising edge before
+    # the gap, while the adjacent main pulse rises at the first CKP rising edge
+    # after the gap. Pulse width is digitised to 12 crank degrees (the nearest
+    # 3-degree half-slot used by this generator).
+    7: {
+        "name": "ISUZU",
+        "car1": "D-MAX 4JK1/4JJ1",
+        "car2": "112 CKP + 5 CMP",
+        "slots": 60,
+        "missing": (56, 57, 58, 59),
+        "isuzu_4j": True,
+        "idle_high": True,
+        # Half-slot falling-edge positions (3 degrees each):
+        # main = 171, 351, 531, 711 degrees; reference = 321 degrees.
+        "cmp_low_starts": (57, 107, 117, 177, 237),
+        "cmp_low_width": 4,
+    },
 }
 
 RPM_MIN = 100
@@ -91,8 +104,12 @@ RPM_HOLD_REPEAT_MS = 140
 # Touch response settings. The XPT2046 driver already returns the median of
 # five raw samples, so two mapped readings within this distance are accepted.
 # A short release grace ignores momentary T_IRQ dropouts while a finger is down.
-TOUCH_STABLE_TOLERANCE = 20
-TOUCH_RELEASE_GRACE_MS = 80
+TOUCH_STABLE_TOLERANCE = 36
+TOUCH_RELEASE_GRACE_MS = 220
+TOUCH_HIT_PAD = 7
+# Once +/- is pressed, keep that button captured while the finger moves.
+# Resistive XPT2046 panels can briefly jitter or flick T_IRQ during a drag.
+TOUCH_HOLD_CAPTURE_PAD = 32
 PATTERN_MIN = min(patterns)
 PATTERN_MAX = max(patterns)
 
@@ -111,12 +128,22 @@ def load_pattern(pattern_id):
     cycle_slot = 0
 
 
+def set_idle_outputs():
+    # The MRE CKP/CMP waveform is normally HIGH between active-low pulses.
+    level = 1 if patterns[active_pattern_id].get("idle_high", False) else 0
+    Pin(CMP_PIN, Pin.OUT, value=level)
+    Pin(CKP_PIN, Pin.OUT, value=level)
+
+
 # ============================================================
-# DISPLAY AND TOUCH
+# DISPLAY AND TOUCH - ST7789 2.8" 320 x 240 LANDSCAPE
 # ============================================================
+SCREEN_W = 320
+SCREEN_H = 240
+
 spi = SPI(
     SPI_ID,
-    baudrate=20_000_000,
+    baudrate=40_000_000,
     polarity=0,
     phase=0,
     sck=Pin(SPI_SCK_PIN),
@@ -124,7 +151,7 @@ spi = SPI(
     miso=Pin(SPI_MISO_PIN),
 )
 
-tft = ST7735(
+tft = ST7789(
     spi,
     cs=Pin(TFT_CS_PIN, Pin.OUT, value=1),
     dc=Pin(TFT_DC_PIN, Pin.OUT, value=0),
@@ -132,27 +159,30 @@ tft = ST7735(
     rotation=1,
 )
 
+# Values below are based on the raw points measured on this 2.8-inch panel:
+# LT=(680,427), RT=(560,3635), LB=(3087,551), RB=(3511,3583).
+# The touch controller axes are crossed relative to landscape display axes.
 touch = XPT2046(
     spi,
     cs=Pin(TOUCH_CS_PIN, Pin.OUT, value=1),
     irq=Pin(TOUCH_IRQ_PIN, Pin.IN, Pin.PULL_UP),
-    width=160,
-    height=128,
-    # These are safe starting values. Run touch_calibrate.py for exact values.
-    x_min=200,
-    x_max=3900,
-    y_min=200,
-    y_max=3900,
-    swap_xy=False,
+    width=SCREEN_W,
+    height=SCREEN_H,
+    x_min=489,
+    x_max=3609,
+    y_min=620,
+    y_max=3299,
+    swap_xy=True,
     invert_x=False,
-    invert_y=True,
+    invert_y=False,
 )
 
 
 # ============================================================
-# ON-SCREEN TOUCH CALIBRATION
+# TOUCH CALIBRATION
 # ============================================================
-CAL_FILE = "touch_cal_v2.json"
+# New filename prevents the old 160x128 ST7735 calibration from being reused.
+CAL_FILE = "touch_cal_st7789_v13.json"
 
 
 def apply_touch_config(config):
@@ -176,30 +206,37 @@ def load_touch_config():
 
 def draw_target(x, y):
     tft.fill(BLACK)
-    tft.text("TOUCH CALIBRATION", 12, 8, CYAN)
-    tft.text("TAP THE TARGET", 24, 22, WHITE)
-    tft.line(x - 9, y, x + 9, y, YELLOW)
-    tft.line(x, y - 9, x, y + 9, YELLOW)
-    tft.rect(x - 5, y - 5, 11, 11, RED)
+    tft.text("TOUCH CALIBRATION", 88, 55, CYAN)
+    tft.text("TAP THE TARGET", 104, 75, WHITE)
+    tft.line(x - 12, y, x + 12, y, YELLOW)
+    tft.line(x, y - 12, x, y + 12, YELLOW)
+    tft.rect(x - 6, y - 6, 13, 13, RED)
     tft.show()
 
 
 def read_calibration_point(x, y):
     draw_target(x, y)
+
+    # Wait for finger to be fully released before accepting the next target.
     while touch.irq.value() == 0:
         sleep_ms(20)
+    # Then wait for a new press.
     while touch.irq.value() == 1:
         sleep_ms(10)
+
     samples = []
     while touch.irq.value() == 0 and len(samples) < 12:
         point = touch.raw()
         if point is not None:
             samples.append(point)
         sleep_ms(15)
+
     while touch.irq.value() == 0:
         sleep_ms(10)
+
     if not samples:
         return read_calibration_point(x, y)
+
     samples.sort(key=lambda item: item[0])
     raw_x = samples[len(samples) // 2][0]
     samples.sort(key=lambda item: item[1])
@@ -213,21 +250,31 @@ def axis_limits(first, second, margin, size):
     slope = (second - first) / span
     edge_first = first - slope * margin
     edge_second = second + slope * margin
-    return int(min(edge_first, edge_second)), int(max(edge_first, edge_second)), edge_first > edge_second
+    return (
+        int(min(edge_first, edge_second)),
+        int(max(edge_first, edge_second)),
+        edge_first > edge_second,
+    )
 
 
 def calibrate_touch():
-    margin = 15
+    margin = 24
     targets = (
         (margin, margin),
-        (159 - margin, margin),
-        (margin, 127 - margin),
-        (159 - margin, 127 - margin),
+        (SCREEN_W - 1 - margin, margin),
+        (margin, SCREEN_H - 1 - margin),
+        (SCREEN_W - 1 - margin, SCREEN_H - 1 - margin),
     )
     raw = [read_calibration_point(x, y) for x, y in targets]
 
-    horizontal_x = abs(((raw[1][0] + raw[3][0]) / 2) - ((raw[0][0] + raw[2][0]) / 2))
-    horizontal_y = abs(((raw[1][1] + raw[3][1]) / 2) - ((raw[0][1] + raw[2][1]) / 2))
+    horizontal_x = abs(
+        ((raw[1][0] + raw[3][0]) / 2) -
+        ((raw[0][0] + raw[2][0]) / 2)
+    )
+    horizontal_y = abs(
+        ((raw[1][1] + raw[3][1]) / 2) -
+        ((raw[0][1] + raw[2][1]) / 2)
+    )
     swap_xy = horizontal_y > horizontal_x
     mapped = [(y, x) if swap_xy else (x, y) for x, y in raw]
 
@@ -235,8 +282,13 @@ def calibrate_touch():
     right = (mapped[1][0] + mapped[3][0]) / 2
     top = (mapped[0][1] + mapped[1][1]) / 2
     bottom = (mapped[2][1] + mapped[3][1]) / 2
-    x_min, x_max, invert_x = axis_limits(left, right, margin, 160)
-    y_min, y_max, invert_y = axis_limits(top, bottom, margin, 128)
+
+    x_min, x_max, invert_x = axis_limits(
+        left, right, margin, SCREEN_W
+    )
+    y_min, y_max, invert_y = axis_limits(
+        top, bottom, margin, SCREEN_H
+    )
 
     config = {
         "x_min": x_min,
@@ -248,27 +300,39 @@ def calibrate_touch():
         "invert_y": invert_y,
     }
     apply_touch_config(config)
+
     try:
         with open(CAL_FILE, "w") as file:
             ujson.dump(config, file)
     except Exception:
         pass
+
     tft.fill(BLACK)
-    tft.text("CALIBRATION OK", 24, 56, GREEN)
+    tft.text("CALIBRATION OK", 104, 112, GREEN)
     tft.show()
     sleep_ms(700)
 
 
-if not load_touch_config():
+# Use the calibration measured today immediately.  A saved V13 calibration,
+# if present, takes priority.  To recalibrate later, delete
+# touch_cal_st7789_v13.json and set FORCE_TOUCH_CALIBRATION = True once.
+FORCE_TOUCH_CALIBRATION = False
+if FORCE_TOUCH_CALIBRATION:
     calibrate_touch()
+else:
+    load_touch_config()
 
 
-def button(x, y, w, h, label, color=BLUE):
+# ============================================================
+# 320 x 240 USER INTERFACE
+# ============================================================
+def button(x, y, w, h, label, color=BLUE, text_scale=2):
     tft.fill_rect(x, y, w, h, color)
     tft.rect(x, y, w, h, WHITE)
-    tx = x + max(3, (w - len(label) * 8) // 2)
-    ty = y + (h - 8) // 2
-    tft.text(label, tx, ty, WHITE)
+    label_w = len(label) * 8 * text_scale
+    tx = x + max(3, (w - label_w) // 2)
+    ty = y + max(2, (h - 8 * text_scale) // 2)
+    big_text(label, tx + label_w // 2, ty, WHITE, text_scale)
 
 
 def big_text(text, center_x, y, color=WHITE, scale=2):
@@ -280,37 +344,56 @@ def big_text(text, center_x, y, color=WHITE, scale=2):
     for py in range(8):
         for px in range(width):
             if font.pixel(px, py):
-                tft.fill_rect(start_x + px * scale, y + py * scale, scale, scale, color)
+                tft.fill_rect(
+                    start_x + px * scale,
+                    y + py * scale,
+                    scale,
+                    scale,
+                    color,
+                )
 
 
 def draw_pattern_screen():
     tft.fill(BLACK)
-    big_text("PATTERN", 80, 5, CYAN, 2)
+
+    big_text("PATTERN", 160, 12, CYAN, 3)
+
     name = patterns[browse_pattern_id]["name"]
-    big_text(name, 80, 35, YELLOW, 3)
+    name_scale = 5 if len(name) <= 6 else 4
+    big_text(name, 160, 55, YELLOW, name_scale)
+
     car1 = patterns[browse_pattern_id]["car1"]
     car2 = patterns[browse_pattern_id]["car2"]
-    tft.text(car1, max(0, 80 - len(car1) * 4), 63, WHITE)
-    tft.text(car2, max(0, 80 - len(car2) * 4), 74, GRAY)
-    button(4, 88, 48, 36, "<", BLUE)
-    button(56, 88, 48, 36, "OK", GREEN)
-    button(108, 88, 48, 36, ">", BLUE)
+    big_text(car1, 160, 105, WHITE, 2)
+    big_text(car2, 160, 128, GRAY, 2)
+
+    # Bottom navigation uses almost the full 320-pixel width.
+    button(8,   174, 92, 56, "<",  BLUE, 3)
+    button(114, 174, 92, 56, "OK", GREEN, 2)
+    button(220, 174, 92, 56, ">",  BLUE, 3)
+
     tft.show()
 
 
 def draw_rpm_screen():
     tft.fill(BLACK)
+
     name = patterns[active_pattern_id]["name"]
-    big_text(name, 80, 3, YELLOW, 2)
-    big_text(str(rpm), 80, 25, WHITE, 3)
-    tft.text("RPM", 68, 52, GRAY)
-    button(4, 66, 74, 27, "-100", RED)
-    button(82, 66, 74, 27, "+100", GREEN)
-    button(4, 98, 48, 26, "BACK", BLUE)
+    big_text(name, 160, 10, YELLOW, 3)
+
+    # RPM value is intentionally large on the 2.8-inch screen.
+    big_text(str(rpm), 160, 48, WHITE, 5)
+    big_text("RPM", 160, 93, GRAY, 2)
+
+    button(8,   122, 146, 50, "-100", RED,   2)
+    button(166, 122, 146, 50, "+100", GREEN, 2)
+
+    button(8,   184, 92, 46, "BACK", BLUE,  2)
     if running:
-        button(56, 98, 100, 26, "STOP", RED)
+        button(114, 184, 198, 46, "STOP", RED, 2)
     else:
-        button(56, 98, 100, 26, "START", GREEN)
+        button(114, 184, 198, 46, "START", GREEN, 2)
+
     tft.show()
 
 
@@ -321,17 +404,49 @@ def draw_screen():
         draw_rpm_screen()
 
 
-def inside(x, y, bx, by, bw, bh):
-    return bx <= x < bx + bw and by <= y < by + bh
+def inside(x, y, bx, by, bw, bh, pad=0):
+    return (bx - pad) <= x < (bx + bw + pad) and (by - pad) <= y < (by + bh + pad)
 
 
-def rpm_hold_action(x, y):
-    """Return the RPM hold action only while the finger is inside its button."""
-    if screen_page != "rpm" or not (58 <= y < 96):
+def rpm_hold_action(x, y, pad=TOUCH_HIT_PAD):
+    """Return RPM direction for a coordinate inside a +/- button."""
+    if screen_page != "rpm":
         return None
-    if x < 80:
+    if inside(x, y, 8, 122, 146, 50, pad):
         return -1
-    return 1
+    if inside(x, y, 166, 122, 146, 50, pad):
+        return 1
+    return None
+
+
+def hold_still_captured(direction, x, y):
+    """Large hysteresis area for an already-pressed +/- button.
+
+    The first press still has to land on the real button. After that, a small
+    finger slide or coordinate jitter will not cancel the hold. The two +/-
+    capture zones are clamped at the screen centre so a slide cannot silently
+    change from - to + or vice versa.
+    """
+    if screen_page != "rpm":
+        return False
+    pad = TOUCH_HOLD_CAPTURE_PAD
+    if direction < 0:
+        return ((8 - pad) <= x < 160 and
+                (122 - pad) <= y < (122 + 50 + pad))
+    return (160 <= x < (166 + 146 + pad) and
+            (122 - pad) <= y < (122 + 50 + pad))
+
+
+def redraw_rpm_value():
+    """V15: update only the RPM strip on the physical TFT.
+
+    V14 still transmitted the complete 320x240 framebuffer after changing
+    the number. V15 sends only this 320x72 rectangle (~23% of the screen).
+    """
+    tft.fill_rect(0, 42, 320, 72, BLACK)
+    big_text(str(rpm), 160, 48, WHITE, 5)
+    big_text("RPM", 160, 93, GRAY, 2)
+    tft.show_rect(0, 42, 320, 72)
 
 
 def repeat_rpm(direction, held_ms):
@@ -339,51 +454,85 @@ def repeat_rpm(direction, held_ms):
     global rpm
     step = 500 if held_ms >= RPM_HOLD_FAST_AFTER_MS else 100
     rpm = max(RPM_MIN, min(RPM_MAX, rpm + direction * step))
-    draw_rpm_screen()
+    redraw_rpm_value()
+
+
+def redraw_pattern_info():
+    """V15: refresh only the changing pattern-name/info area."""
+    tft.fill_rect(0, 48, 320, 112, BLACK)
+    name = patterns[browse_pattern_id]["name"]
+    name_scale = 5 if len(name) <= 6 else 4
+    big_text(name, 160, 55, YELLOW, name_scale)
+    big_text(patterns[browse_pattern_id]["car1"], 160, 105, WHITE, 2)
+    big_text(patterns[browse_pattern_id]["car2"], 160, 128, GRAY, 2)
+    tft.show_rect(0, 48, 320, 112)
+
+
+def redraw_start_stop_button():
+    """V15: refresh only START/STOP instead of the whole screen."""
+    if running:
+        button(114, 184, 198, 46, "STOP", RED, 2)
+    else:
+        button(114, 184, 198, 46, "START", GREEN, 2)
+    tft.show_rect(114, 184, 198, 46)
 
 
 def handle_touch(x, y):
     global browse_pattern_id, rpm, running, cycle_slot, screen_page
 
     if screen_page == "pattern":
-        if y >= 80 and x < 54:
+        if inside(x, y, 8, 174, 92, 56, TOUCH_HIT_PAD):
             browse_pattern_id -= 1
             if browse_pattern_id < PATTERN_MIN:
                 browse_pattern_id = PATTERN_MAX
-        elif y >= 80 and x >= 106:
+            redraw_pattern_info()
+            return True
+
+        if inside(x, y, 220, 174, 92, 56, TOUCH_HIT_PAD):
             browse_pattern_id += 1
             if browse_pattern_id > PATTERN_MAX:
                 browse_pattern_id = PATTERN_MIN
-        elif y >= 80:
+            redraw_pattern_info()
+            return True
+
+        if inside(x, y, 114, 174, 92, 56, TOUCH_HIT_PAD):
             load_pattern(browse_pattern_id)
             screen_page = "rpm"
-        else:
-            return False
-    elif 58 <= y < 96 and x < 80:
+            draw_rpm_screen()
+            return True
+        return False
+
+    if inside(x, y, 8, 122, 146, 50, TOUCH_HIT_PAD):
         rpm = max(RPM_MIN, rpm - 100)
-    elif 58 <= y < 96 and x >= 80:
+        redraw_rpm_value()
+        return True
+
+    if inside(x, y, 166, 122, 146, 50, TOUCH_HIT_PAD):
         rpm = min(RPM_MAX, rpm + 100)
-    elif y >= 94 and x < 54:
+        redraw_rpm_value()
+        return True
+
+    if inside(x, y, 8, 184, 92, 46, TOUCH_HIT_PAD):
         if running:
             running = False
             sm.active(0)
-            Pin(CMP_PIN, Pin.OUT, value=0)
-            Pin(CKP_PIN, Pin.OUT, value=0)
+            set_idle_outputs()
         screen_page = "pattern"
-    elif y >= 94 and x >= 54:
+        draw_pattern_screen()
+        return True
+
+    if inside(x, y, 114, 184, 198, 46, TOUCH_HIT_PAD):
         running = not running
         cycle_slot = 0
         if not running:
             sm.active(0)
-            Pin(CMP_PIN, Pin.OUT, value=0)
-            Pin(CKP_PIN, Pin.OUT, value=0)
+            set_idle_outputs()
         else:
             sm.active(1)
-    else:
-        return False
+        redraw_start_stop_button()
+        return True
 
-    draw_screen()
-    return True
+    return False
 
 
 # ============================================================
@@ -406,10 +555,38 @@ def packed_word(first_level, second_level, half_period_us):
     return first_level | (second_level << 2) | (count << 4)
 
 
+def isuzu_cmp_level(half_slot, p):
+    for start in p["cmp_low_starts"]:
+        # Modulo handles the main pulse at 711 degrees crossing the 720-degree
+        # cycle boundary and ending at 3 degrees of the next cycle.
+        if (half_slot - start) % (p["slots"] * 4) < p["cmp_low_width"]:
+            return 0
+    return 1
+
+
 def signal_word(slot):
     p = patterns[active_pattern_id]
     position = slot % p["slots"]
     half_us = (60_000_000 / (rpm * p["slots"])) / 2
+
+    if p.get("isuzu_4j", False):
+        first_half_slot = slot * 2
+        second_half_slot = first_half_slot + 1
+        cmp_first = isuzu_cmp_level(first_half_slot, p)
+        cmp_second = isuzu_cmp_level(second_half_slot, p)
+
+        if position in p["missing"]:
+            ckp_first = 1
+            ckp_second = 1
+        else:
+            # Isuzu manual CH2: active-low tooth pulse, HIGH missing gap.
+            ckp_first = 0
+            ckp_second = 1
+
+        first_level = cmp_first | (ckp_first << 1)
+        second_level = cmp_second | (ckp_second << 1)
+        return packed_word(first_level, second_level, half_us)
+
     if p.get("ckp_only", False):
         cmp_level = 0
     else:
@@ -433,8 +610,6 @@ sm = rp2.StateMachine(
 
 draw_screen()
 touch_down = False
-touch_candidate = None
-touch_stable_count = 0
 touch_hold_action = None
 touch_hold_started = 0
 touch_hold_last_repeat = 0
@@ -443,50 +618,34 @@ touch_last_seen = ticks_ms()
 try:
     while True:
         point = touch.get_touch()
-        if point is None:
-            # Do not treat a single missing sample as a release. Resistive
-            # touch IRQ can briefly flicker when finger pressure changes.
-            if ticks_diff(ticks_ms(), touch_last_seen) >= TOUCH_RELEASE_GRACE_MS:
-                touch_down = False
-                touch_candidate = None
-                touch_stable_count = 0
-                touch_hold_action = None
-        elif not touch_down:
-            touch_last_seen = ticks_ms()
-            if (touch_candidate is not None and
-                    abs(point[0] - touch_candidate[0]) <= TOUCH_STABLE_TOLERANCE and
-                    abs(point[1] - touch_candidate[1]) <= TOUCH_STABLE_TOLERANCE):
-                touch_stable_count += 1
-                touch_candidate = ((touch_candidate[0] + point[0]) // 2,
-                                   (touch_candidate[1] + point[1]) // 2)
-            else:
-                touch_candidate = point
-                touch_stable_count = 1
+        now = ticks_ms()
 
-            # Accept a press only after two nearby readings. If the first
-            # reading lands in a gap, keep trying until the finger is stable.
-            if touch_stable_count >= 2:
-                # Remember whether this press began on an RPM +/- button.
-                # This is checked again on every repeat so sliding the finger
-                # outside the original button stops auto-repeat immediately.
-                new_hold_action = rpm_hold_action(
-                    touch_candidate[0], touch_candidate[1]
-                )
-                if handle_touch(touch_candidate[0], touch_candidate[1]):
+        if point is None:
+            # Keep a short release grace because T_IRQ can flicker while a
+            # finger is still touching the resistive panel.
+            if touch_down and ticks_diff(now, touch_last_seen) >= TOUCH_RELEASE_GRACE_MS:
+                touch_down = False
+                touch_hold_action = None
+        else:
+            touch_last_seen = now
+            if not touch_down:
+                # V15 accepts the first MEDIAN-filtered coordinate immediately.
+                # This fixes short taps that V14 could miss while waiting for a
+                # second stable coordinate. The XPT driver itself filters 3
+                # samples, and button hitboxes have a small edge allowance.
+                new_hold_action = rpm_hold_action(point[0], point[1])
+                if handle_touch(point[0], point[1]):
                     touch_down = True
                     touch_hold_action = new_hold_action
-                    touch_hold_started = ticks_ms()
-                    touch_hold_last_repeat = touch_hold_started
-                touch_candidate = None
-                touch_stable_count = 0
-        else:
-            touch_last_seen = ticks_ms()
-            if touch_hold_action is not None:
-                # Keep repeating only while the finger remains on the same button.
-                if rpm_hold_action(point[0], point[1]) != touch_hold_action:
-                    touch_hold_action = None
-                else:
-                    now = ticks_ms()
+                    touch_hold_started = now
+                    touch_hold_last_repeat = now
+            elif touch_hold_action is not None:
+                # V16 touch capture: do not cancel a held +/- button just
+                # because the finger moves a few pixels. Resistive panels
+                # naturally jitter while pressure shifts. Only leave the
+                # capture when the coordinate moves well outside its enlarged
+                # zone; a brief IRQ dropout is handled by release grace above.
+                if hold_still_captured(touch_hold_action, point[0], point[1]):
                     held_ms = ticks_diff(now, touch_hold_started)
                     since_repeat = ticks_diff(now, touch_hold_last_repeat)
                     if (held_ms >= RPM_HOLD_DELAY_MS and
@@ -508,7 +667,6 @@ try:
 
 except KeyboardInterrupt:
     sm.active(0)
-    Pin(CMP_PIN, Pin.OUT, value=0)
-    Pin(CKP_PIN, Pin.OUT, value=0)
+    set_idle_outputs()
     # MicroPico sends Ctrl+C when it opens an interactive REPL. Keep the
     # current screen visible instead of replacing it with a STOPPED page.
